@@ -1,14 +1,18 @@
 """Shared Playwright helpers for JS-rendered Steam pages.
 
-Adapted from steamframe-check/steamframe_monitor.py: wait for sale-display,
-scroll to mount lazy sections, capture fullest text + action labels.
+Playwright's sync API is greenlet-bound to a single thread. All browser work
+runs on one dedicated worker thread so asyncio.to_thread / PICS gevent never
+touch the Playwright objects from another thread.
+
+Adapted from steamframe-check/steamframe_monitor.py.
 """
 
 from __future__ import annotations
 
+import queue
 import re
 import threading
-from typing import Any
+from typing import Any, Callable
 
 
 CONTENT_SELECTOR = '[data-featuretarget="sale-display"]'
@@ -76,50 +80,57 @@ def price_matches(text: str) -> list[str]:
 
 
 class PlaywrightSession:
-    """Long-lived headless Chromium for repeated Steam page captures."""
+    """Proxy that marshals all Playwright calls onto one dedicated thread."""
 
     def __init__(self, user_agent: str = DEFAULT_UA) -> None:
         self.user_agent = user_agent
-        self._lock = threading.RLock()
-        self._playwright: Any = None
-        self._browser: Any = None
-        self._context: Any = None
-        self._page: Any = None
+        self._jobs: queue.Queue = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._ready = threading.Event()
+        self._start_error: Exception | None = None
+        self._stopped = threading.Event()
 
-    def _ensure_started(self) -> None:
-        if self._page is not None:
+    def _ensure_worker(self) -> None:
+        if self._thread and self._thread.is_alive():
             return
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError as exc:
-            raise BrowserError(
-                "playwright is not installed. Run: "
-                "pip install playwright && playwright install chromium"
-            ) from exc
-
-        self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(headless=True)
-        self._context = self._browser.new_context(
-            user_agent=self.user_agent,
-            locale="en-US",
-            viewport={"width": 1366, "height": 900},
+        self._ready.clear()
+        self._start_error = None
+        self._stopped.clear()
+        self._thread = threading.Thread(
+            target=self._worker_main,
+            name="frameme-playwright",
+            daemon=True,
         )
-        self._page = self._context.new_page()
+        self._thread.start()
+        if not self._ready.wait(timeout=60):
+            raise BrowserError("Playwright worker failed to start")
+        if self._start_error is not None:
+            raise BrowserError(str(self._start_error)) from self._start_error
+
+    def _call(self, fn: Callable[[], Any], timeout: float = 180.0) -> Any:
+        self._ensure_worker()
+        result_q: queue.Queue = queue.Queue(maxsize=1)
+        self._jobs.put((fn, result_q))
+        ok, payload = result_q.get(timeout=timeout)
+        if ok:
+            return payload
+        raise payload
 
     def stop(self) -> None:
-        with self._lock:
-            for obj in (self._page, self._context, self._browser):
-                try:
-                    if obj is not None:
-                        obj.close()
-                except Exception:
-                    pass
-            if self._playwright is not None:
-                try:
-                    self._playwright.stop()
-                except Exception:
-                    pass
-            self._page = self._context = self._browser = self._playwright = None
+        if not self._thread or not self._thread.is_alive():
+            return
+        done = queue.Queue(maxsize=1)
+
+        def _shutdown() -> None:
+            raise _Shutdown()
+
+        self._jobs.put((_shutdown, done))
+        try:
+            done.get(timeout=30)
+        except Exception:
+            pass
+        self._stopped.wait(timeout=30)
+        self._thread = None
 
     def capture_page_text(
         self,
@@ -129,34 +140,14 @@ class PlaywrightSession:
         settle_ms: int = 3000,
         content_selector: str | None = None,
     ) -> dict[str, Any]:
-        """Load a JS-rendered page and return normalized body/region text."""
-        with self._lock:
-            self._ensure_started()
-            assert self._page is not None
-            page = self._page
-
-            page.goto(url, wait_until=wait_until, timeout=PAGE_TIMEOUT_MS)
-            if content_selector:
-                try:
-                    page.wait_for_selector(content_selector, timeout=PAGE_TIMEOUT_MS)
-                except Exception:
-                    pass
-            page.wait_for_timeout(settle_ms)
-
-            title = page.title()
-            if content_selector:
-                el = page.query_selector(content_selector)
-                text = el.inner_text() if el else page.inner_text("body")
-            else:
-                text = page.inner_text("body")
-
-            text = normalize(text or "")
-            return {
-                "text": text,
-                "title": title,
-                "final_url": page.url,
-                "length": len(text),
-            }
+        return self._call(
+            lambda: self._do_capture_page_text(
+                url,
+                wait_until=wait_until,
+                settle_ms=settle_ms,
+                content_selector=content_selector,
+            )
+        )
 
     def capture_sale_page(
         self,
@@ -164,47 +155,136 @@ class PlaywrightSession:
         *,
         content_selector: str = CONTENT_SELECTOR,
     ) -> dict[str, Any]:
-        """Load URL, scroll-mount lazy content, return normalized text + meta."""
-        with self._lock:
-            self._ensure_started()
-            assert self._page is not None
-            page = self._page
+        return self._call(
+            lambda: self._do_capture_sale_page(url, content_selector=content_selector)
+        )
 
-            page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+    # --- runs only on the Playwright worker thread ---
+
+    def _worker_main(self) -> None:
+        playwright = browser = context = page = None
+        try:
+            from playwright.sync_api import sync_playwright
+
+            playwright = sync_playwright().start()
+            browser = playwright.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=self.user_agent,
+                locale="en-US",
+                viewport={"width": 1366, "height": 900},
+            )
+            page = context.new_page()
+            self._page = page
+            self._ready.set()
+        except Exception as exc:
+            self._start_error = exc
+            self._ready.set()
+            self._stopped.set()
+            return
+
+        try:
+            while True:
+                job = self._jobs.get()
+                if job is None:
+                    break
+                fn, result_q = job
+                try:
+                    result = fn()
+                    result_q.put((True, result))
+                except _Shutdown:
+                    result_q.put((True, None))
+                    break
+                except Exception as exc:
+                    result_q.put((False, exc))
+        finally:
+            for obj in (page, context, browser):
+                try:
+                    if obj is not None:
+                        obj.close()
+                except Exception:
+                    pass
+            if playwright is not None:
+                try:
+                    playwright.stop()
+                except Exception:
+                    pass
+            self._page = None
+            self._stopped.set()
+
+    def _do_capture_page_text(
+        self,
+        url: str,
+        *,
+        wait_until: str,
+        settle_ms: int,
+        content_selector: str | None,
+    ) -> dict[str, Any]:
+        page = self._page
+        page.goto(url, wait_until=wait_until, timeout=PAGE_TIMEOUT_MS)
+        if content_selector:
             try:
                 page.wait_for_selector(content_selector, timeout=PAGE_TIMEOUT_MS)
             except Exception:
                 pass
-            page.wait_for_timeout(RENDER_SETTLE_MS)
+        page.wait_for_timeout(settle_ms)
 
-            full_text = self._capture_full(page, content_selector)
+        title = page.title()
+        if content_selector:
             el = page.query_selector(content_selector)
-            if not el and not full_text:
-                raise BrowserError(f"content region not found: {content_selector}")
+            text = el.inner_text() if el else page.inner_text("body")
+        else:
+            text = page.inner_text("body")
 
-            parts = [full_text or (el.inner_text() if el else "")]
-            actions: list[str] = []
-            if el:
-                for h in el.query_selector_all("a, button, input[type=submit]"):
-                    label = (h.inner_text() or h.get_attribute("value") or "").strip()
-                    href = h.get_attribute("href") or ""
-                    if label:
-                        actions.append(
-                            f"[ACTION] {label}" + (f"  ->  {href}" if href else "")
-                        )
-            if actions:
-                seen: set[str] = set()
-                uniq = [a for a in actions if not (a in seen or seen.add(a))]
-                parts.append("\n--- page actions ---\n" + "\n".join(uniq))
+        text = normalize(text or "")
+        return {
+            "text": text,
+            "title": title,
+            "final_url": page.url,
+            "length": len(text),
+        }
 
-            text = normalize("\n".join(parts))
-            return {
-                "text": text,
-                "final_url": page.url,
-                "actions": actions,
-                "length": len(text),
-                "selector_found": el is not None,
-            }
+    def _do_capture_sale_page(
+        self,
+        url: str,
+        *,
+        content_selector: str,
+    ) -> dict[str, Any]:
+        page = self._page
+        page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        try:
+            page.wait_for_selector(content_selector, timeout=PAGE_TIMEOUT_MS)
+        except Exception:
+            pass
+        page.wait_for_timeout(RENDER_SETTLE_MS)
+
+        full_text = self._capture_full(page, content_selector)
+        el = page.query_selector(content_selector)
+        if not el and not full_text:
+            raise BrowserError(f"content region not found: {content_selector}")
+
+        parts = [full_text or (el.inner_text() if el else "")]
+        actions: list[str] = []
+        if el:
+            for h in el.query_selector_all("a, button, input[type=submit]"):
+                label = (h.inner_text() or h.get_attribute("value") or "").strip()
+                href = h.get_attribute("href") or ""
+                if label:
+                    actions.append(
+                        f"[ACTION] {label}" + (f"  ->  {href}" if href else "")
+                    )
+        if actions:
+            seen: set[str] = set()
+            uniq = [a for a in actions if not (a in seen or seen.add(a))]
+            parts.append("\n--- page actions ---\n" + "\n".join(uniq))
+
+        text = normalize("\n".join(parts))
+        return {
+            "text": text,
+            "final_url": page.url,
+            "actions": actions,
+            "length": len(text),
+            "selector_found": el is not None,
+        }
 
     def _capture_full(self, page: Any, content_selector: str) -> str:
         page.evaluate("window.scrollTo(0, 0)")
@@ -228,6 +308,10 @@ class PlaywrightSession:
                 stagnant = 0
             last_h = h
         return best
+
+
+class _Shutdown(Exception):
+    pass
 
 
 _session: PlaywrightSession | None = None
