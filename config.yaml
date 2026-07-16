@@ -39,7 +39,8 @@ watchers:
   - id: steam_pics
     enabled: true
     tier: 2
-    interval_seconds: 30
+    # Persistent anonymous session; avoid re-login thrash (TryAnotherCM / throttle)
+    interval_seconds: 60
     # SteamDB URLs are view-only links in alerts (no scraping)
 
   - id: importgenius

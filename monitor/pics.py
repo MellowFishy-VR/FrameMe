@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
-from typing import Callable
+from typing import Any, Callable
 
-from monitor.http_client import content_hash
+from monitor.http_client import backoff_until, content_hash
 from monitor.models import AlertEvent, WatcherConfig, utcnow
 from monitor.state import StateStore
 
@@ -28,9 +27,14 @@ STEAMDB_LINKS = {
     ),
 }
 
+# Steam EResult values we handle specially
+ERESULT_TRY_ANOTHER_CM = 48
+ERESULT_RATE_LIMIT = 84
+ERESULT_LOGIN_THROTTLE = 87
+
 
 class PicsWatcherThread:
-    """Runs ValvePython steam client in an isolated gevent-friendly thread."""
+    """Runs ValvePython steam client in an isolated thread with a persistent login."""
 
     def __init__(
         self,
@@ -48,6 +52,7 @@ class PicsWatcherThread:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._tracked_subs: set[int] = set()
+        self._client: Any = None
 
     @property
     def id(self) -> str:
@@ -66,13 +71,17 @@ class PicsWatcherThread:
 
     def stop(self) -> None:
         self._stop.set()
+        self._disconnect()
 
     def run_once_test(self) -> dict:
         """Synchronous one-shot for --test mode."""
-        return self._poll_once(emit_alerts=False)
+        try:
+            return self._poll_once(emit_alerts=False)
+        finally:
+            self._disconnect()
 
     def _run(self) -> None:
-        interval = max(15, int(self.config.interval_seconds or 30))
+        interval = max(30, int(self.config.interval_seconds or 60))
         while not self._stop.is_set():
             state = self.store.get(self.id)
             if state.is_disabled:
@@ -85,115 +94,153 @@ class PicsWatcherThread:
                 self._poll_once(emit_alerts=True)
             except Exception as exc:
                 self.on_log(f"{self.id}: error — {exc}")
-                from monitor.http_client import backoff_until
-
+                self._disconnect()
                 until = backoff_until(state.error_count + 1, interval)
+                # TryAnotherCM / throttle: prefer a healthier floor
+                msg = str(exc)
+                if "48" in msg or "TryAnotherCM" in msg or "RateLimit" in msg or "Throttle" in msg:
+                    until = backoff_until(max(state.error_count + 2, 3), max(interval, 60))
                 self.store.mark_error(self.id, str(exc), until)
             self._stop.wait(interval)
+        self._disconnect()
+
+    def _disconnect(self) -> None:
+        client = self._client
+        self._client = None
+        if client is None:
+            return
+        try:
+            if getattr(client, "logged_on", False):
+                client.logout()
+        except Exception:
+            pass
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+
+    def _ensure_client(self) -> Any:
+        from steam.client import SteamClient
+        from steam.enums import EResult
+
+        client = self._client
+        if client is not None and getattr(client, "logged_on", False):
+            return client
+
+        # Stale / dead client
+        self._disconnect()
+
+        client = SteamClient()
+        # Fresh CM list helps with TryAnotherCM
+        try:
+            client.cm_servers.clear()
+        except Exception:
+            pass
+
+        result = client.anonymous_login()
+        if result == EResult.TryAnotherCM or int(result) == ERESULT_TRY_ANOTHER_CM:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+            client = SteamClient()
+            result = client.anonymous_login()
+
+        if result != EResult.OK:
+            name = getattr(result, "name", str(result))
+            raise RuntimeError(f"anonymous_login failed: {result} ({name})")
+
+        self._client = client
+        self.on_log(f"{self.id}: anonymous Steam session connected")
+        return client
 
     def _poll_once(self, emit_alerts: bool) -> dict:
         try:
-            from steam.client import SteamClient
-            from steam.enums import EResult
+            from steam.client import SteamClient  # noqa: F401 — import check
         except ImportError as exc:
             msg = f"steam[client] not installed: {exc}"
             self.on_log(f"{self.id}: {msg}")
             raise RuntimeError(msg) from exc
 
-        client = SteamClient()
-        result = client.anonymous_login()
-        if result != EResult.OK:
-            raise RuntimeError(f"anonymous_login failed: {result}")
+        client = self._ensure_client()
+        state = self.store.get(self.id)
+        last_change = int(state.parsed.get("change_number") or 0)
 
-        try:
-            state = self.store.get(self.id)
-            last_change = int(state.parsed.get("change_number") or 0)
-
-            if last_change <= 0:
-                # Seed with current product info without needing changelist history
-                info = client.get_product_info(apps=list(TRACKED_APPS), timeout=30)
-                snapshot = self._snapshot_from_product_info(info)
-                fingerprint = content_hash(str(snapshot))
-                baseline_was_set = state.baseline_set
-                self.store.mark_success(self.id, fingerprint, snapshot)
-                if self.on_success:
-                    self.on_success()
-                self.on_log(
-                    f"{self.id}: baseline changenumber={snapshot.get('change_number')} "
-                    f"apps={list(snapshot.get('apps', {}).keys())}"
-                )
-                return {"parsed": snapshot, "alerts": [], "baseline": not baseline_was_set}
-
-            changes = client.get_changes_since(
-                last_change,
-                app_changes=True,
-                package_changes=True,
-            )
-            current_change = int(getattr(changes, "current_change_number", 0) or last_change)
-
-            app_changes = list(getattr(changes, "app_changes", []) or [])
-            pkg_changes = list(getattr(changes, "package_changes", []) or [])
-
-            interesting_apps = [
-                a for a in app_changes if int(getattr(a, "appid", 0)) in TRACKED_APPS
-            ]
-
-            # Always refresh product info for tracked apps when changenumber moves
-            # or on interval; filter package changes against known/related subs.
+        if last_change <= 0:
             info = client.get_product_info(apps=list(TRACKED_APPS), timeout=30)
             snapshot = self._snapshot_from_product_info(info)
-            snapshot["change_number"] = max(
-                current_change, int(snapshot.get("change_number") or 0)
-            )
-
-            # Expand tracked subs from product info
-            for app_data in (snapshot.get("apps") or {}).values():
-                for sid in app_data.get("subids") or []:
-                    self._tracked_subs.add(int(sid))
-
-            interesting_pkgs = [
-                p
-                for p in pkg_changes
-                if int(getattr(p, "packageid", 0)) in self._tracked_subs
-            ]
-
             fingerprint = content_hash(str(snapshot))
-            prev = dict(state.parsed)
             baseline_was_set = state.baseline_set
             self.store.mark_success(self.id, fingerprint, snapshot)
             if self.on_success:
                 self.on_success()
-
-            alerts: list[AlertEvent] = []
-            if baseline_was_set:
-                alerts = self._diff_alerts(
-                    prev,
-                    snapshot,
-                    interesting_apps=interesting_apps,
-                    interesting_pkgs=interesting_pkgs,
-                )
-
-            if emit_alerts:
-                for alert in alerts:
-                    self.on_alert(alert)
-
             self.on_log(
-                f"{self.id}: changenumber={snapshot.get('change_number')} "
-                f"app_changes={len(interesting_apps)} pkg_changes={len(interesting_pkgs)} "
-                f"alerts={len(alerts)}"
+                f"{self.id}: baseline changenumber={snapshot.get('change_number')} "
+                f"apps={list(snapshot.get('apps', {}).keys())}"
             )
-            return {"parsed": snapshot, "alerts": alerts}
-        finally:
-            try:
-                client.logout()
-            except Exception:
-                pass
+            return {"parsed": snapshot, "alerts": [], "baseline": not baseline_was_set}
+
+        changes = client.get_changes_since(
+            last_change,
+            app_changes=True,
+            package_changes=True,
+        )
+        current_change = int(getattr(changes, "current_change_number", 0) or last_change)
+
+        app_changes = list(getattr(changes, "app_changes", []) or [])
+        pkg_changes = list(getattr(changes, "package_changes", []) or [])
+
+        interesting_apps = [
+            a for a in app_changes if int(getattr(a, "appid", 0)) in TRACKED_APPS
+        ]
+
+        info = client.get_product_info(apps=list(TRACKED_APPS), timeout=30)
+        snapshot = self._snapshot_from_product_info(info)
+        snapshot["change_number"] = max(
+            current_change, int(snapshot.get("change_number") or 0)
+        )
+
+        for app_data in (snapshot.get("apps") or {}).values():
+            for sid in app_data.get("subids") or []:
+                self._tracked_subs.add(int(sid))
+
+        interesting_pkgs = [
+            p
+            for p in pkg_changes
+            if int(getattr(p, "packageid", 0)) in self._tracked_subs
+        ]
+
+        fingerprint = content_hash(str(snapshot))
+        prev = dict(state.parsed)
+        baseline_was_set = state.baseline_set
+        self.store.mark_success(self.id, fingerprint, snapshot)
+        if self.on_success:
+            self.on_success()
+
+        alerts: list[AlertEvent] = []
+        if baseline_was_set:
+            alerts = self._diff_alerts(
+                prev,
+                snapshot,
+                interesting_apps=interesting_apps,
+                interesting_pkgs=interesting_pkgs,
+            )
+
+        if emit_alerts:
+            for alert in alerts:
+                self.on_alert(alert)
+
+        self.on_log(
+            f"{self.id}: changenumber={snapshot.get('change_number')} "
+            f"app_changes={len(interesting_apps)} pkg_changes={len(interesting_pkgs)} "
+            f"alerts={len(alerts)}"
+        )
+        return {"parsed": snapshot, "alerts": alerts}
 
     def _snapshot_from_product_info(self, info) -> dict:
         apps_out: dict[str, dict] = {}
         change_number = 0
         apps = getattr(info, "apps", None) or info.get("apps") if isinstance(info, dict) else {}
-        # steam library returns dict-like structure
         if hasattr(info, "apps"):
             apps = info.apps
         elif isinstance(info, dict):
@@ -203,13 +250,11 @@ class PicsWatcherThread:
             aid = int(appid)
             if aid not in TRACKED_APPS:
                 continue
-            # appinfo may be dict with nested common/extended/etc.
             data = appinfo if isinstance(appinfo, dict) else {}
             common = data.get("common") or {}
             extended = data.get("extended") or {}
             depots = data.get("depots") or {}
 
-            # changenumber sometimes at top level
             cn = data.get("_change_number") or data.get("change_number") or 0
             try:
                 change_number = max(change_number, int(cn))
@@ -217,7 +262,6 @@ class PicsWatcherThread:
                 pass
 
             packages = []
-            # package list often under depots/packages or common
             for key in ("packages", "packageids"):
                 val = depots.get(key) or common.get(key) or extended.get(key) or data.get(key)
                 if isinstance(val, dict):
@@ -236,7 +280,6 @@ class PicsWatcherThread:
                 "is_free": common.get("isfreeapp") or common.get("freeapp") or "",
             }
 
-        # Also capture package infos if present
         packages_out: dict[str, dict] = {}
         pkgs = getattr(info, "packages", None)
         if pkgs is None and isinstance(info, dict):
@@ -334,7 +377,6 @@ class PicsWatcherThread:
                 )
 
         if curr_cn > prev_cn and (interesting_apps or interesting_pkgs or not alerts):
-            # Generic changenumber bump when tracked apps appear in changelist
             changed_sections = []
             if interesting_apps:
                 changed_sections.append(
@@ -347,7 +389,6 @@ class PicsWatcherThread:
                 )
             if changed_sections or curr_apps != prev_apps:
                 if not any("new sub" in a.title.lower() for a in alerts):
-                    # Only add generic if we have interesting changes or app snapshot diffs
                     if interesting_apps or interesting_pkgs or curr_apps != prev_apps:
                         links = STEAMDB_LINKS[STEAM_FRAME_APP]
                         alerts.append(
