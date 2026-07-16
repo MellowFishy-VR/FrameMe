@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""FrameMe — Steam Frame availability monitor for Windows and Linux."""
+"""FrameMe — multi-source Steam Frame availability monitor for Windows and Linux."""
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import threading
@@ -10,8 +11,8 @@ import webbrowser
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSettings, QTimer, QUrl, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QCloseEvent, QIcon
+from PySide6.QtCore import QObject, QSettings, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QApplication,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSystemTrayIcon,
@@ -28,21 +30,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from steam_checker import (
-    STEAM_FRAME_APP_ID,
-    STEAM_FRAME_URL,
-    STEAM_MACHINE_APP_ID,
-    CheckResult,
-    ProductStatus,
-    check_availability,
-)
+from monitor.engine import MonitorEngine
+from monitor.models import AlertEvent
+from steam_checker import STEAM_FRAME_URL, STEAM_MACHINE_APP_ID, check_availability
 
-CHECK_INTERVAL_MS = 60_000
 APP_NAME = "FrameMe"
 ORG_NAME = "FrameMe"
 SETTINGS_SOUND = "sound_path"
 SETTINGS_MONITORING = "monitoring_enabled"
-SETTINGS_LAST_STATUS = "last_frame_status"
 
 
 def config_dir() -> Path:
@@ -81,15 +76,18 @@ class NotificationService:
         self._worker_ready = threading.Event()
         self._tray_click_handler = None
         self._use_desktop_notifier = False
+        self._urgency_critical = None
+        self._urgency_normal = None
 
         try:
             from desktop_notifier import DesktopNotifier, Urgency
 
-            self._urgency = Urgency.Critical
+            self._urgency_critical = Urgency.Critical
+            self._urgency_normal = Urgency.Normal
             self._start_worker(DesktopNotifier)
             self._use_desktop_notifier = True
         except ImportError:
-            self._urgency = None
+            pass
 
     def _start_worker(self, notifier_cls) -> None:
         def worker() -> None:
@@ -107,13 +105,14 @@ class NotificationService:
         if not self._worker_ready.wait(timeout=10):
             self._use_desktop_notifier = False
 
-    async def _send_async(self, title: str, message: str, on_clicked) -> None:
+    async def _send_async(
+        self, title: str, message: str, on_clicked, urgency
+    ) -> None:
         assert self._notifier is not None
-
         await self._notifier.send(
             title=title,
             message=message,
-            urgency=self._urgency,
+            urgency=urgency,
             on_clicked=on_clicked,
         )
 
@@ -123,12 +122,15 @@ class NotificationService:
         message: str,
         tray: QSystemTrayIcon | None,
         on_clicked,
+        *,
+        critical: bool = True,
     ) -> None:
-        if self._use_desktop_notifier and self._loop is not None:
+        urgency = self._urgency_critical if critical else self._urgency_normal
+        if self._use_desktop_notifier and self._loop is not None and urgency is not None:
             import asyncio
 
             asyncio.run_coroutine_threadsafe(
-                self._send_async(title, message, on_clicked),
+                self._send_async(title, message, on_clicked, urgency),
                 self._loop,
             )
             return
@@ -144,7 +146,7 @@ class NotificationService:
             tray.messageClicked.connect(on_clicked)
             tray.showMessage(
                 title,
-                message + "\n(Click to stop the looping alert and open the store page)",
+                message + "\n(Click to open link / stop alert)",
                 QSystemTrayIcon.MessageIcon.Information,
                 10_000,
             )
@@ -210,6 +212,13 @@ class NotificationBridge(QObject):
     clicked = Signal()
 
 
+class EngineBridge(QObject):
+    """Marshals monitor engine callbacks onto the Qt GUI thread."""
+
+    log_line = Signal(str)
+    alert = Signal(object)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -221,25 +230,23 @@ class MainWindow(QMainWindow):
         self.sound._player.playbackStateChanged.connect(self._sync_alert_ui)
         self._alert_url = STEAM_FRAME_URL
 
-        self._last_frame_status = ProductStatus(
-            self.settings.value(SETTINGS_LAST_STATUS, ProductStatus.UNKNOWN.value)
-        )
+        self._engine_bridge = EngineBridge()
+        self._engine_bridge.log_line.connect(self.append_log)
+        self._engine_bridge.alert.connect(self._dispatch_alert)
+
         self._monitoring = self.settings.value(SETTINGS_MONITORING, True, type=bool)
         self._sound_path = self.settings.value(SETTINGS_SOUND, "")
         self.sound.set_sound(self._sound_path or None)
 
-        self._timer = QTimer(self)
-        self._timer.setInterval(CHECK_INTERVAL_MS)
-        self._timer.timeout.connect(self._run_frame_check)
+        self._engine: MonitorEngine | None = None
 
         self._build_ui()
         self._build_tray()
         self._sync_monitoring_ui()
 
-        self.append_log("FrameMe started. Monitoring checks every 60 seconds when enabled.")
+        self.append_log("FrameMe started (multi-source monitor).")
         if self._monitoring:
-            self._timer.start()
-            QTimer.singleShot(1500, self._run_frame_check)
+            self._start_engine()
 
     def _build_ui(self) -> None:
         self.setWindowTitle("FrameMe — Steam Frame Tracker")
@@ -250,9 +257,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(root)
 
         header = QLabel(
-            "<b>Steam Frame availability monitor</b><br>"
-            "Runs in the system tray, checks every minute, and loops an alert until you "
-            "click the notification to reserve."
+            "<b>Steam Frame multi-source monitor</b><br>"
+            "Watches store pages, Komodo, Steamworks, PICS, and more. "
+            "Tier 1 alerts loop until you click the notification to reserve."
         )
         header.setWordWrap(True)
         layout.addWidget(header)
@@ -297,15 +304,10 @@ class MainWindow(QMainWindow):
 
         test_machine_btn = QPushButton("Test check (Steam Machine)")
         test_machine_btn.setToolTip(
-            f"Runs a live API check against app {STEAM_MACHINE_APP_ID}. "
-            "If this works, the Steam Frame check should work too."
+            f"Runs a live API check against app {STEAM_MACHINE_APP_ID}."
         )
         test_machine_btn.clicked.connect(self._test_machine_check)
         btn_row.addWidget(test_machine_btn)
-
-        check_now_btn = QPushButton("Check Steam Frame now")
-        check_now_btn.clicked.connect(self._run_frame_check)
-        btn_row.addWidget(check_now_btn)
 
         open_store_btn = QPushButton("Open store page")
         open_store_btn.clicked.connect(lambda: webbrowser.open(STEAM_FRAME_URL))
@@ -318,7 +320,10 @@ class MainWindow(QMainWindow):
         self.log_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         layout.addWidget(self.log_view, stretch=1)
 
-        tray_hint = QLabel("Closing the window keeps FrameMe running in the tray.")
+        tray_hint = QLabel(
+            "Closing the window keeps FrameMe running in the tray. "
+            "Edit config.yaml to toggle watchers."
+        )
         tray_hint.setStyleSheet("color: gray;")
         layout.addWidget(tray_hint)
 
@@ -330,33 +335,26 @@ class MainWindow(QMainWindow):
         self.tray.setIcon(icon)
         self.setWindowIcon(icon)
 
-        menu = self.tray.contextMenu()
-        if menu is None:
-            from PySide6.QtWidgets import QMenu
+        menu = QMenu()
+        show_action = QAction("Show window", self)
+        show_action.triggered.connect(self._show_window)
+        menu.addAction(show_action)
 
-            menu = QMenu()
-            show_action = QAction("Show window", self)
-            show_action.triggered.connect(self._show_window)
-            menu.addAction(show_action)
-
-            check_action = QAction("Check Steam Frame now", self)
-            check_action.triggered.connect(self._run_frame_check)
-            menu.addAction(check_action)
-
-            menu.addSeparator()
-            quit_action = QAction("Quit FrameMe", self)
-            quit_action.triggered.connect(self._quit_app)
-            menu.addAction(quit_action)
+        menu.addSeparator()
+        quit_action = QAction("Quit FrameMe", self)
+        quit_action.triggered.connect(self._quit_app)
+        menu.addAction(quit_action)
 
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._tray_activated)
         self.tray.show()
 
     def _sync_monitoring_ui(self) -> None:
+        n = self._engine.enabled_count if self._engine else "?"
         if self._monitoring:
             self.monitor_btn.setText("Monitoring: ON")
             self.monitor_btn.setStyleSheet("font-weight: bold;")
-            self.status_label.setText("Status: monitoring enabled (every 60s)")
+            self.status_label.setText(f"Status: monitoring enabled — {n} watchers")
         else:
             self.monitor_btn.setText("Monitoring: OFF")
             self.monitor_btn.setStyleSheet("")
@@ -366,11 +364,29 @@ class MainWindow(QMainWindow):
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.log_view.append(f"[{stamp}] {message}")
 
+    def _start_engine(self) -> None:
+        if self._engine and self._engine.running:
+            return
+        self._engine = MonitorEngine(
+            on_log=lambda m: self._engine_bridge.log_line.emit(m),
+            on_alert=lambda a: self._engine_bridge.alert.emit(a),
+        )
+        self._engine.start()
+        self._sync_monitoring_ui()
+
+    def _stop_engine(self, reason: str = "") -> None:
+        if self._engine:
+            self._engine.stop()
+            self._engine = None
+        if reason:
+            self.append_log(reason)
+        self._sync_monitoring_ui()
+
     def _stop_monitoring(self, reason: str = "") -> None:
         was_active = self._monitoring
         self._monitoring = False
-        self._timer.stop()
         self.settings.setValue(SETTINGS_MONITORING, False)
+        self._stop_engine()
         self._sync_monitoring_ui()
         if reason and was_active:
             self.append_log(reason)
@@ -382,10 +398,9 @@ class MainWindow(QMainWindow):
             return
         self._monitoring = True
         self.settings.setValue(SETTINGS_MONITORING, True)
-        self._timer.start()
+        self._start_engine()
         self._sync_monitoring_ui()
         self.append_log("Monitoring enabled.")
-        self._run_frame_check()
 
     @Slot()
     def _browse_sound(self) -> None:
@@ -419,6 +434,9 @@ class MainWindow(QMainWindow):
                 "Test alert: sound is looping. Click this notification to stop "
                 "and open the Steam Frame reservation page."
             ),
+            url=STEAM_FRAME_URL,
+            critical=True,
+            loop_sound=True,
         )
 
     def _sync_alert_ui(self) -> None:
@@ -428,62 +446,61 @@ class MainWindow(QMainWindow):
     def _test_machine_check(self) -> None:
         self.append_log(f"Running test check for Steam Machine (app {STEAM_MACHINE_APP_ID})…")
         result = check_availability(STEAM_MACHINE_APP_ID)
-        self._log_check_result(result, prefix="TEST")
+        self.append_log(f"TEST: {result.log_line}")
 
-    @Slot()
-    def _run_frame_check(self) -> None:
-        result = check_availability(STEAM_FRAME_APP_ID)
-        self._log_check_result(result, prefix="CHECK")
-        self._handle_frame_transition(result)
-
-    def _log_check_result(self, result: CheckResult, prefix: str = "CHECK") -> None:
-        if result.status is ProductStatus.ERROR:
-            self.append_log(f"{prefix}: ERROR — {result.detail}")
+    @Slot(object)
+    def _dispatch_alert(self, alert: object) -> None:
+        if not isinstance(alert, AlertEvent):
             return
-        self.append_log(f"{prefix}: {result.log_line}")
+        self.append_log(alert.log_line())
 
-    def _handle_frame_transition(self, result: CheckResult) -> None:
-        if result.status is ProductStatus.ERROR:
+        if alert.tier == 1:
+            self._fire_alert(
+                title=alert.title,
+                message=alert.message,
+                url=alert.url or STEAM_FRAME_URL,
+                critical=True,
+                loop_sound=True,
+            )
+            if alert.stop_monitoring:
+                self._stop_monitoring(
+                    "Monitoring stopped automatically — confirmed reservation signal."
+                )
             return
 
-        became_purchasable = (
-            not self._last_frame_status.is_purchasable and result.status.is_purchasable
+        # Tier 2 / digest (tier 3 flushed as digest with tier=3)
+        self._fire_alert(
+            title=alert.title,
+            message=alert.message,
+            url=alert.url or STEAM_FRAME_URL,
+            critical=False,
+            loop_sound=False,
         )
 
-        if became_purchasable:
-            if result.status is ProductStatus.AVAILABLE:
-                title = "Steam Frame is available!"
-                message = (
-                    "You can reserve a Steam Frame now! The alert is looping — "
-                    "click this notification to stop it and open the store page."
-                )
-            else:
-                title = "Steam Frame pre-orders open!"
-                message = (
-                    "Steam Frame pre-orders are open! The alert is looping — "
-                    "click this notification to stop it and reserve yours."
-                )
-            self.append_log(f"ALERT: {result.status.label()} — sending notification.")
-            self._fire_alert(title=title, message=message)
-            self._stop_monitoring(
-                "Monitoring stopped automatically — Steam Frame is ready to reserve."
-            )
-
-        self._last_frame_status = result.status
-        self.settings.setValue(SETTINGS_LAST_STATUS, result.status.value)
-
-    def _fire_alert(self, title: str, message: str) -> None:
-        self._alert_url = STEAM_FRAME_URL
-        self.sound.start_alert_loop()
-        self._sync_alert_ui()
+    def _fire_alert(
+        self,
+        title: str,
+        message: str,
+        url: str,
+        *,
+        critical: bool = True,
+        loop_sound: bool = True,
+    ) -> None:
+        self._alert_url = url or STEAM_FRAME_URL
+        if loop_sound:
+            self.sound.start_alert_loop()
+            self._sync_alert_ui()
         self.notifications.send(
             title,
             message,
             self.tray,
             on_clicked=self._notify_bridge.clicked.emit,
+            critical=critical,
         )
-        if not self.isVisible():
-            self.tray.showMessage(APP_NAME, message, QSystemTrayIcon.MessageIcon.Information, 5000)
+        if not self.isVisible() and loop_sound:
+            self.tray.showMessage(
+                APP_NAME, message, QSystemTrayIcon.MessageIcon.Information, 5000
+            )
 
     @Slot()
     def _stop_alert_only(self) -> None:
@@ -496,7 +513,8 @@ class MainWindow(QMainWindow):
     def _on_notification_clicked(self) -> None:
         self.sound.stop()
         self._sync_alert_ui()
-        webbrowser.open(self._alert_url)
+        if self._alert_url:
+            webbrowser.open(self._alert_url)
 
     @Slot()
     def _show_window(self) -> None:
@@ -527,12 +545,12 @@ class MainWindow(QMainWindow):
 
     def _quit_app(self) -> None:
         self.sound.stop()
-        self._timer.stop()
+        self._stop_engine()
         self.tray.hide()
         QApplication.quit()
 
 
-def main() -> int:
+def run_gui() -> int:
     QApplication.setOrganizationName(ORG_NAME)
     QApplication.setApplicationName(APP_NAME)
 
@@ -550,6 +568,24 @@ def main() -> int:
     window = MainWindow()
     window.show()
     return app.exec()
+
+
+def run_test() -> int:
+    engine = MonitorEngine(dry_run=True, on_log=print)
+    return engine.run_test()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="FrameMe Steam Frame multi-source monitor")
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run every enabled watcher once, print extracted state, send no alerts",
+    )
+    args = parser.parse_args()
+    if args.test:
+        return run_test()
+    return run_gui()
 
 
 if __name__ == "__main__":

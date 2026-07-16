@@ -1,0 +1,63 @@
+# FrameMe multi-source monitor configuration
+# Toggle sources with `enabled` without code changes.
+
+user_agent: "FrameMe/2.0 (+https://github.com/frameme; personal Steam Frame availability monitor)"
+heartbeat_tier1_timeout_seconds: 600
+heartbeat_alert_cooldown_seconds: 1800
+tier3_digest_interval_seconds: 1800
+tier3_digest_min_items: 3
+stagger_seconds: 7
+# state_dir: defaults to ~/.config/frameme/state
+
+watchers:
+  - id: steam_frame_appdetails
+    enabled: true
+    tier: 1
+    interval_seconds: 60
+    app_id: "4165890"
+
+  - id: steam_frame_sale
+    enabled: true
+    tier: 1
+    interval_seconds: 60
+    # Playwright + scroll-capture of sale-display (same method as steamframe-check)
+    url: "https://store.steampowered.com/hardware/steamframe"
+    content_selector: '[data-featuretarget="sale-display"]'
+
+  - id: komodo
+    enabled: true
+    tier: 1
+    interval_seconds: 300
+    url: "https://komodostation.com/product/steam-frame_jpy/?lang=en"
+
+  - id: steamworks
+    enabled: true
+    tier: 1
+    interval_seconds: 120
+    url: "https://steamcommunity.com/groups/steamworks/announcements"
+
+  - id: steam_pics
+    enabled: true
+    tier: 2
+    interval_seconds: 30
+    # SteamDB URLs are view-only links in alerts (no scraping)
+
+  - id: importgenius
+    enabled: true
+    tier: 3
+    interval_seconds: 21600
+    urls:
+      - "https://importgenius.com/suppliers/tech-front-chongqing-computer-co"
+      - "https://importgenius.com/importers/valve-corp"
+
+  - id: fcc_valve
+    enabled: true
+    tier: 3
+    interval_seconds: 43200
+    url: "https://fccid.io/2AES4"
+
+  - id: valve_compliance
+    enabled: true
+    tier: 3
+    interval_seconds: 21600
+    url: "https://help.steampowered.com/en/faqs/view/3D15-B320-C20E-BACD"
