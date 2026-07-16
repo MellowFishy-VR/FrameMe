@@ -12,6 +12,7 @@ Inspired by [SteamFrameTracker](https://github.com/tomgamer22/SteamFrameTracker)
 - Config-driven watchers in [`config.yaml`](config.yaml) (toggle without code changes)
 - Tiered alerts (critical / quieter / digest)
 - Transition-only alerts (persisted state under `~/.config/frameme/state/`)
+- Append-only **change log** with unified diffs (`~/.config/frameme/changes.log`)
 - Custom alert sound (WAV, MP3, OGG, FLAC)
 - **Looping Tier 1 alert** until notification click
 - Heartbeat: Tier 1 silent failure → `MONITORING BROKEN` alert
@@ -26,14 +27,19 @@ Inspired by [SteamFrameTracker](https://github.com/tomgamer22/SteamFrameTracker)
 | `steam_frame_sale` | 1 | 60s | Hardware page via **Playwright** (scroll-load `sale-display`, same method as steamframe-check) |
 | `komodo` | 1 | 5m | JP distributor stock/price/cart |
 | `steamworks` | 1 | 2m | Steamworks announcements (keyword match) |
-| `steam_pics` | 2 | ~30s | Anonymous Steam PICS for `4165890` + `3990420` |
+| `steam_pics` | 2 | 60s | Anonymous Steam PICS for `4165890` + `3990420` (persistent session) |
 | `importgenius` | 3 | 6h | Shipment pages (best-effort; auto-disables if paywalled) |
 | `fcc_valve` | 3 | 12h | FCC filings for grantee `2AES4` |
-| `valve_compliance` | 3 | 6h | Valve hardware compliance FAQ body changes |
+| `valve_compliance` | 3 | 6h | Valve hardware compliance FAQ via **Playwright** |
 
-**PICS vs SteamDB:** we do **not** scrape steamdb.info (ToS / blocking). Alerts include SteamDB URLs as human “view details” links only. Data comes from Steam PICS via `steam[client]`.
+**PICS vs SteamDB:** we do **not** scrape steamdb.info (ToS / blocking). Alerts include SteamDB URLs as human “view details” links only. Data comes from Steam PICS via `steam[client]`. A persistent anonymous session avoids `TryAnotherCM` login thrash. Global Steam `change_number` ticks are tracked but **not** written to the change log unless tracked app/package payload actually changes.
 
-**Sale page:** `steam_frame_sale` uses headless Chromium (Playwright) against `hardware/steamframe`, waits for `[data-featuretarget="sale-display"]`, scrolls to the bottom so lazy sections mount, then hashes that region — same approach as `steamframe-check/steamframe_monitor.py`. Plain HTTP alone only sees an empty JS shell.
+**Sale page:** `steam_frame_sale` uses headless Chromium (Playwright) against `hardware/steamframe`, waits for `[data-featuretarget="sale-display"]`, runs two scroll passes so lazy sections mount, then hashes a stabilized snapshot of that region — same approach as `steamframe-check/steamframe_monitor.py`. Plain HTTP alone only sees an empty JS shell.
+
+Hardening against false alerts from incomplete lazy-load:
+- Strip volatile tracking params (`snr`, `curator_clanid`) and sort action links before hashing
+- Ignore slightly shorter captures that have **no** substantive line-level diff (incomplete scroll); real edits that shrink the page still alert
+- Trivial/noise fingerprint flips update state but do not alert or log
 
 ## Alert tiers
 
@@ -84,6 +90,17 @@ Runs every enabled watcher once, prints extracted fields + stored state, sends *
 Edit [`config.yaml`](config.yaml) to enable/disable sources, change intervals, or tweak heartbeat / digest settings.
 
 State files: `~/.config/frameme/state/<watcher_id>.json`
+
+### Change log
+
+Path: `~/.config/frameme/changes.log`
+
+Append-only unified diffs for **substantive** watcher transitions (and fired alerts). It does **not** log every poll:
+
+- Unchanged fingerprints → silent
+- Suppressed noise / normalize-only rewrites → silent
+- PICS global `change_number`-only bumps → silent
+- Real content diffs (sale page text, appdetails, tracked PICS payload, etc.) → logged
 
 ## Alert behavior (Tier 1)
 

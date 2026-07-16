@@ -75,6 +75,54 @@ class BaseWatcher(ABC):
         if result.fingerprint == previous_fp and result.parsed == previous_parsed:
             return []
 
+        # Noise / normalize rewrites update state but do not belong in changes.log
+        if result.suppress_alerts:
+            return []
+
+        # Log substantive state transitions only
+        try:
+            from monitor.changelog import append_change
+            import json
+
+            old_text = result.change_old_text
+            new_text = result.change_new_text
+            if old_text is None and new_text is None:
+                def _slim(d: dict) -> dict:
+                    out = {}
+                    for k, v in d.items():
+                        if k == "full_text":
+                            continue
+                        out[k] = v
+                    return out
+
+                old_text = json.dumps(_slim(previous_parsed), indent=2, sort_keys=True, default=str)
+                new_text = json.dumps(_slim(result.parsed), indent=2, sort_keys=True, default=str)
+
+            # Skip empty / whitespace-only "changes"
+            if (old_text or "") == (new_text or ""):
+                return list(result.alerts)
+
+            summary = result.change_summary or result.log_message or "state changed"
+            if result.alerts:
+                summary = f"{summary} | alerts: " + "; ".join(a.title for a in result.alerts)
+
+            url = ""
+            if result.alerts:
+                url = result.alerts[0].url or ""
+            elif isinstance(result.parsed.get("final_url"), str):
+                url = result.parsed["final_url"]
+
+            append_change(
+                self.id,
+                summary,
+                old_text=old_text or "",
+                new_text=new_text or "",
+                url=url,
+                alert=bool(result.alerts),
+            )
+        except Exception:
+            pass
+
         return list(result.alerts)
 
     def make_alert(

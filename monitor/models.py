@@ -40,6 +40,12 @@ class WatcherResult:
     disable_reason: str = ""
     http_status: int | None = None
     retryable_error: bool = False
+    # Optional full-text payloads for changes.log (e.g. sale page HTML text)
+    change_old_text: str | None = None
+    change_new_text: str | None = None
+    change_summary: str = ""
+    # If True, fingerprint changed but should not alert (noise/flicker)
+    suppress_alerts: bool = False
 
 
 @dataclass

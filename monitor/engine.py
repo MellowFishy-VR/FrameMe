@@ -84,6 +84,20 @@ class MonitorEngine:
         return self._running
 
     def _emit_alert(self, alert: AlertEvent) -> None:
+        # Heartbeat / digest / PICS alerts that skip BaseWatcher.apply_result
+        if alert.source in ("heartbeat", "digest") or alert.source.startswith("steam_pics"):
+            try:
+                from monitor.changelog import append_change
+
+                append_change(
+                    alert.source,
+                    f"[T{alert.tier}] {alert.title} — {alert.message}",
+                    url=alert.url or "",
+                    alert=True,
+                )
+            except Exception as exc:
+                self.on_log(f"changelog write failed: {exc}")
+
         if self.dry_run:
             self.on_log(f"DRY-RUN alert suppressed: {alert.log_line()}")
             return

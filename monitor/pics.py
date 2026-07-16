@@ -212,6 +212,7 @@ class PicsWatcherThread:
 
         fingerprint = content_hash(str(snapshot))
         prev = dict(state.parsed)
+        prev_fp = state.fingerprint
         baseline_was_set = state.baseline_set
         self.store.mark_success(self.id, fingerprint, snapshot)
         if self.on_success:
@@ -225,6 +226,38 @@ class PicsWatcherThread:
                 interesting_apps=interesting_apps,
                 interesting_pkgs=interesting_pkgs,
             )
+            # Steam's global change_number ticks constantly — only log when
+            # tracked app/package payload actually changed (or we alerted).
+            prev_content = {k: v for k, v in prev.items() if k != "change_number"}
+            new_content = {
+                k: v for k, v in snapshot.items() if k != "change_number"
+            }
+            if alerts or prev_content != new_content:
+                try:
+                    import json
+
+                    from monitor.changelog import append_change
+
+                    append_change(
+                        self.id,
+                        f"PICS snapshot changed cn={prev.get('change_number')}->"
+                        f"{snapshot.get('change_number')}"
+                        + (
+                            f" | alerts: {'; '.join(a.title for a in alerts)}"
+                            if alerts
+                            else ""
+                        ),
+                        old_text=json.dumps(
+                            prev_content, indent=2, sort_keys=True, default=str
+                        ),
+                        new_text=json.dumps(
+                            new_content, indent=2, sort_keys=True, default=str
+                        ),
+                        url=STEAMDB_LINKS[STEAM_FRAME_APP][1],
+                        alert=bool(alerts),
+                    )
+                except Exception:
+                    pass
 
         if emit_alerts:
             for alert in alerts:

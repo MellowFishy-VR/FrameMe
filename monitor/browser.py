@@ -66,6 +66,38 @@ def normalize(text: str) -> str:
     return "\n".join(out).strip()
 
 
+def stabilize_sale_text(text: str) -> str:
+    """Drop volatile tracking params / action order so captures hash stably."""
+    body_lines: list[str] = []
+    action_lines: list[str] = []
+    in_actions = False
+    for line in text.splitlines():
+        if line.strip() == "--- page actions ---":
+            in_actions = True
+            continue
+        if in_actions or line.startswith("[ACTION]"):
+            in_actions = True
+            if not line.startswith("[ACTION]"):
+                continue
+            label, sep, href = line.partition("->")
+            label = label.strip()
+            href = href.strip()
+            if href:
+                href = re.sub(r"[?&](snr|curator_clanid)=[^&\s]*", "", href)
+                href = href.rstrip("?&")
+                action_lines.append(f"{label}  ->  {href}" if href else label)
+            else:
+                action_lines.append(label)
+            continue
+        body_lines.append(line)
+
+    parts = ["\n".join(body_lines).strip()]
+    if action_lines:
+        # Sort so DOM order flicker doesn't flip the hash
+        parts.append("--- page actions ---\n" + "\n".join(sorted(set(action_lines))))
+    return normalize("\n".join(parts))
+
+
 def find_new_signals(old_text: str, new_text: str) -> list[str]:
     old_l, new_l = old_text.lower(), new_text.lower()
     hits = []
@@ -257,7 +289,13 @@ class PlaywrightSession:
             pass
         page.wait_for_timeout(RENDER_SETTLE_MS)
 
+        # Two full scroll passes — keep the fullest (lazy sections sometimes miss once)
         full_text = self._capture_full(page, content_selector)
+        page.wait_for_timeout(800)
+        full_text2 = self._capture_full(page, content_selector)
+        if len(full_text2) > len(full_text):
+            full_text = full_text2
+
         el = page.query_selector(content_selector)
         if not el and not full_text:
             raise BrowserError(f"content region not found: {content_selector}")
@@ -277,7 +315,7 @@ class PlaywrightSession:
             uniq = [a for a in actions if not (a in seen or seen.add(a))]
             parts.append("\n--- page actions ---\n" + "\n".join(uniq))
 
-        text = normalize("\n".join(parts))
+        text = stabilize_sale_text(normalize("\n".join(parts)))
         return {
             "text": text,
             "final_url": page.url,
@@ -288,10 +326,11 @@ class PlaywrightSession:
 
     def _capture_full(self, page: Any, content_selector: str) -> str:
         page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(200)
         best, stagnant, last_h = "", 0, -1
-        for _ in range(60):
-            page.mouse.wheel(0, 1200)
-            page.wait_for_timeout(350)
+        for _ in range(80):
+            page.mouse.wheel(0, 1400)
+            page.wait_for_timeout(400)
             el = page.query_selector(content_selector)
             txt = el.inner_text() if el else ""
             if len(txt) > len(best):
@@ -302,11 +341,17 @@ class PlaywrightSession:
             h = page.evaluate("document.body.scrollHeight")
             if at_bottom and h == last_h:
                 stagnant += 1
-                if stagnant >= 5:
+                if stagnant >= 6:  # settle longer at true bottom
                     break
             else:
                 stagnant = 0
             last_h = h
+        # Final pause + re-read at bottom (sections sometimes mount late)
+        page.wait_for_timeout(500)
+        el = page.query_selector(content_selector)
+        final = el.inner_text() if el else ""
+        if len(final) > len(best):
+            best = final
         return best
 
 
