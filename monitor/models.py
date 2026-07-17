@@ -74,6 +74,36 @@ class WatcherConfig:
 
 
 @dataclass
+class DiscordConfig:
+    """Optional Discord forwarding for alerts (webhook or bot token)."""
+
+    enabled: bool = False
+    # auto | bot | webhook — auto prefers bot when token+channel are set
+    mode: str = "auto"
+    webhook_url: str = ""
+    bot_token: str = ""
+    channel_id: str = ""
+    # Which alert tiers to forward (3 = Tier 3 digests)
+    tiers: list[int] = field(default_factory=lambda: [1, 2, 3])
+    username: str = "FrameMe"  # webhook display name only
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> DiscordConfig:
+        data = data or {}
+        tiers_raw = data.get("tiers", [1, 2, 3])
+        tiers = [int(t) for t in tiers_raw] if tiers_raw else [1, 2, 3]
+        return cls(
+            enabled=bool(data.get("enabled", False)),
+            mode=str(data.get("mode") or "auto"),
+            webhook_url=str(data.get("webhook_url") or ""),
+            bot_token=str(data.get("bot_token") or ""),
+            channel_id=str(data.get("channel_id") or ""),
+            tiers=tiers,
+            username=str(data.get("username") or "FrameMe"),
+        )
+
+
+@dataclass
 class GlobalConfig:
     user_agent: str
     heartbeat_tier1_timeout_seconds: int = 600
@@ -83,3 +113,4 @@ class GlobalConfig:
     state_dir: str = ""
     stagger_seconds: float = 7.0
     watchers: list[WatcherConfig] = field(default_factory=list)
+    discord: DiscordConfig = field(default_factory=DiscordConfig)

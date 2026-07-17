@@ -10,6 +10,7 @@ from monitor.watchers.importgenius import ImportGeniusWatcher
 from monitor.watchers.komodo import KomodoWatcher
 from monitor.watchers.steam_frame_appdetails import SteamFrameAppdetailsWatcher
 from monitor.watchers.steam_frame_sale import SteamFrameSaleWatcher
+from monitor.watchers.steam_news import SteamNewsWatcher
 from monitor.watchers.steamworks import SteamworksWatcher
 from monitor.watchers.valve_compliance import ValveComplianceWatcher
 
@@ -23,6 +24,7 @@ WATCHER_CLASSES: dict[str, type[BaseWatcher]] = {
     "steam_frame_sale": SteamFrameSaleWatcher,
     "komodo": KomodoWatcher,
     "steamworks": SteamworksWatcher,
+    "steam_news": SteamNewsWatcher,
     "importgenius": ImportGeniusWatcher,
     "fcc_valve": FccWatcher,
     "valve_compliance": ValveComplianceWatcher,

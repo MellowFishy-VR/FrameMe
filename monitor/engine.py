@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from monitor.config import load_config
+from monitor.discord_notify import DiscordNotifier
 from monitor.http_client import HttpClient
 from monitor.models import AlertEvent, GlobalConfig, WatcherResult, utcnow
 from monitor.pics import PicsWatcherThread, pics_fallback_appdetails_poll
@@ -41,6 +42,16 @@ class MonitorEngine:
         self.on_log = on_log or (lambda m: log.info(m))
         self._external_on_alert = on_alert
         self.dry_run = dry_run
+        dc = self.config.discord
+        self.discord = DiscordNotifier(
+            enabled=dc.enabled,
+            mode=dc.mode,
+            webhook_url=dc.webhook_url,
+            bot_token=dc.bot_token,
+            channel_id=dc.channel_id,
+            tiers=dc.tiers,
+            username=dc.username,
+        )
 
         self._watchers: list[BaseWatcher] = []
         self._scheduler: WatcherScheduler | None = None
@@ -57,6 +68,16 @@ class MonitorEngine:
         self._started_at: datetime | None = None
 
         self._build_watchers()
+        if self.discord.enabled:
+            self.on_log(
+                f"Discord {self.discord.transport} enabled "
+                f"(tiers={sorted(self.discord.tiers)})."
+            )
+        elif dc.enabled:
+            self.on_log(
+                "Discord enabled in config but not configured "
+                "(need webhook_url, or bot_token + channel_id)."
+            )
 
     def _build_watchers(self) -> None:
         self._watchers = []
@@ -107,6 +128,22 @@ class MonitorEngine:
             self.on_log(f"Queued Tier 3: {alert.log_line()}")
             self._maybe_flush_digest(force=False)
             return
+        self._deliver_alert(alert)
+
+    def _deliver_alert(self, alert: AlertEvent) -> None:
+        """Desktop notify (+ optional Discord) for a ready-to-fire alert."""
+        if self.discord.enabled:
+            try:
+                if self.discord.send_alert(alert):
+                    self.on_log(
+                        f"Discord {self.discord.transport} sent: {alert.title}"
+                    )
+                elif alert.tier in self.discord.tiers:
+                    self.on_log(
+                        f"Discord {self.discord.transport} failed: {alert.title}"
+                    )
+            except Exception as exc:
+                self.on_log(f"Discord error: {exc}")
         if self._external_on_alert:
             self._external_on_alert(alert)
 
@@ -135,8 +172,10 @@ class MonitorEngine:
             message="\n".join(lines)[:1500],
             url=items[0].url if items else "",
         )
-        if self._external_on_alert:
-            self._external_on_alert(digest)
+        if self.dry_run:
+            self.on_log(f"DRY-RUN digest suppressed: {digest.log_line()}")
+            return
+        self._deliver_alert(digest)
 
     def start(self) -> None:
         if self._running:
@@ -282,8 +321,8 @@ class MonitorEngine:
             stop_monitoring=False,
         )
         self.on_log(alert.log_line())
-        if self._external_on_alert and not self.dry_run:
-            self._external_on_alert(alert)
+        if not self.dry_run:
+            self._deliver_alert(alert)
 
     def run_test(self) -> int:
         """Run every enabled watcher once; print extracted state; no alerts."""

@@ -1,5 +1,6 @@
 # FrameMe multi-source monitor configuration
-# Toggle sources with `enabled` without code changes.
+# Copy to config.yaml (done automatically on first run) and edit locally.
+# config.yaml is gitignored — never commit secrets.
 
 user_agent: "FrameMe/2.0 (+https://github.com/frameme; personal Steam Frame availability monitor)"
 heartbeat_tier1_timeout_seconds: 600
@@ -8,6 +9,20 @@ tier3_digest_interval_seconds: 1800
 tier3_digest_min_items: 3
 stagger_seconds: 7
 # state_dir: defaults to ~/.config/frameme/state
+
+# Optional Discord alerts — webhook OR bot token (bot preferred when both set).
+# Guild ID is not required; invite the bot with Send Messages + Embed Links.
+# Prefer env vars over putting secrets in this file:
+#   FRAMEME_DISCORD_BOT_TOKEN / FRAMEME_DISCORD_CHANNEL_ID
+#   FRAMEME_DISCORD_WEBHOOK
+discord:
+  enabled: false
+  mode: auto          # auto | bot | webhook
+  bot_token: ""
+  channel_id: ""      # right-click channel → Copy Channel ID (Developer Mode)
+  webhook_url: ""
+  tiers: [1, 2, 3]
+  username: "FrameMe" # webhook display name only
 
 watchers:
   - id: steam_frame_appdetails
@@ -35,6 +50,17 @@ watchers:
     tier: 1
     interval_seconds: 120
     url: "https://steamcommunity.com/groups/steamworks/announcements"
+
+  - id: steam_news
+    enabled: true
+    tier: 1
+    interval_seconds: 120
+    # Official Steam RDF news feed + ISteamNews for Frame/Machine app hubs
+    feeds:
+      - "https://store.steampowered.com/feeds/news.xml"
+    news_app_ids: [4165890, 4165910]
+    # Regex; tighter than steamworks so the noisy main feed stays quiet
+    keywords: "steam\\s*frame|steamframe|steam\\s*machine|steammachine|steam\\s*controller|steamcontroller|reservation|pre-?order|preorder|standalone\\s*verified|hardware/steamframe"
 
   - id: steam_pics
     enabled: true

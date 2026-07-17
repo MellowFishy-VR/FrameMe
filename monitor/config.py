@@ -1,23 +1,37 @@
-"""Load YAML monitor configuration."""
+"""Load YAML monitor configuration; generate local config.yaml if missing."""
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from monitor.http_client import DEFAULT_UA
-from monitor.models import GlobalConfig, WatcherConfig
+from monitor.models import DiscordConfig, GlobalConfig, WatcherConfig
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = REPO_ROOT / "config.yaml"
+EXAMPLE_CONFIG_PATH = REPO_ROOT / "config.example.yaml"
+
+
+def ensure_config(path: Path | None = None) -> Path:
+    """Return config path, copying config.example.yaml if config.yaml is missing."""
+    config_path = Path(path) if path else DEFAULT_CONFIG_PATH
+    if config_path.is_file():
+        return config_path
+    if not EXAMPLE_CONFIG_PATH.is_file():
+        raise FileNotFoundError(
+            f"Config not found: {config_path} (and no {EXAMPLE_CONFIG_PATH.name} to copy)"
+        )
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(EXAMPLE_CONFIG_PATH, config_path)
+    return config_path
 
 
 def load_config(path: Path | None = None) -> GlobalConfig:
-    config_path = Path(path) if path else DEFAULT_CONFIG_PATH
-    if not config_path.is_file():
-        raise FileNotFoundError(f"Config not found: {config_path}")
+    config_path = ensure_config(path)
 
     raw: dict[str, Any] = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     watchers = [WatcherConfig.from_dict(w) for w in (raw.get("watchers") or [])]
@@ -39,4 +53,5 @@ def load_config(path: Path | None = None) -> GlobalConfig:
         state_dir=state_dir,
         stagger_seconds=float(raw.get("stagger_seconds", 7.0)),
         watchers=watchers,
+        discord=DiscordConfig.from_dict(raw.get("discord")),
     )

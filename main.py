@@ -258,7 +258,8 @@ class MainWindow(QMainWindow):
 
         header = QLabel(
             "<b>Steam Frame multi-source monitor</b><br>"
-            "Watches store pages, Komodo, Steamworks, PICS, and more. "
+            "Watches store pages, Steam News, Komodo, Steamworks, PICS, and more. "
+            "Optional Discord webhook in config.yaml. "
             "Tier 1 alerts loop until you click the notification to reserve."
         )
         header.setWordWrap(True)

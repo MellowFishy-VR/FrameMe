@@ -8,3 +8,7 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+
+# Local secrets / machine config (generated from config.example.yaml)
+config.yaml
+config.local.yaml
