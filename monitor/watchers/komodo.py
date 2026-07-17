@@ -15,6 +15,26 @@ PRICE_RE = re.compile(
     re.I,
 )
 LEAD_NOTE = "komodo may lead the US announcement"
+UNKNOWN = "unknown"
+# Soft 200s / challenge pages are usually much smaller than the real PDP.
+MIN_PAGE_CHARS = 8_000
+
+# Order matters: more specific / negative first.
+STOCK_NEEDLES: tuple[tuple[str, str], ...] = (
+    ("out of stock", "out_of_stock"),
+    ("sold out", "sold_out"),
+    ("売り切れ", "sold_out"),
+    ("在庫なし", "out_of_stock"),
+    ("in stock", "in_stock"),
+    ("在庫あり", "in_stock"),
+    ("pre-order", "preorder"),
+    ("preorder", "preorder"),
+    ("予約受付", "preorder"),
+    ("coming soon", "coming_soon"),
+    ("近日発売", "coming_soon"),
+    ("comingsoon", "coming_soon"),
+    ("unavailable", "unavailable"),
+)
 
 
 class KomodoWatcher(BaseWatcher):
@@ -37,6 +57,13 @@ class KomodoWatcher(BaseWatcher):
         except Exception as exc:
             return self.handle_http_exception(exc)
 
+        # Incomplete / challenge HTML — do not treat as a stock transition.
+        if len(resp.text) < MIN_PAGE_CHARS:
+            return self._keep_previous(
+                f"{self.id}: short response ({len(resp.text)} chars) — parse skipped",
+                http_status=resp.status,
+            )
+
         soup = BeautifulSoup(resp.text, "html.parser")
         text = soup.get_text(" ", strip=True)
 
@@ -44,6 +71,18 @@ class KomodoWatcher(BaseWatcher):
         price_match = PRICE_RE.search(text)
         price = price_match.group(0) if price_match else None
         cart_enabled = self._cart_enabled(soup)
+
+        prev = self.state().parsed
+        prev_stock = str(prev.get("stock") or "")
+
+        # Ambiguous parse: keep last known stock so we never alert on
+        # coming_soon <-> unknown flicker from flaky HTML.
+        if stock == UNKNOWN:
+            return self._keep_previous(
+                f"{self.id}: stock inconclusive — keeping "
+                f"{prev_stock or UNKNOWN!r}",
+                http_status=resp.status,
+            )
 
         fingerprint = content_hash(f"{stock}|{price}|{cart_enabled}")
         parsed = {
@@ -53,13 +92,17 @@ class KomodoWatcher(BaseWatcher):
         }
 
         alerts = []
-        prev = self.state().parsed
         if self.state().baseline_set:
-            if prev.get("stock") and prev.get("stock") != stock:
+            if (
+                prev_stock
+                and prev_stock != stock
+                and prev_stock != UNKNOWN
+                and stock != UNKNOWN
+            ):
                 alerts.append(
                     self.make_alert(
                         "Komodo stock status changed",
-                        f"{prev.get('stock')} -> {stock}. Note: {LEAD_NOTE}",
+                        f"{prev_stock} -> {stock}. Note: {LEAD_NOTE}",
                         url,
                     )
                 )
@@ -100,25 +143,70 @@ class KomodoWatcher(BaseWatcher):
             http_status=resp.status,
         )
 
-    def _stock_status(self, soup: BeautifulSoup, text: str) -> str:
-        lower = text.lower()
-        for needle, label in (
-            ("out of stock", "out_of_stock"),
-            ("sold out", "sold_out"),
-            ("in stock", "in_stock"),
-            ("pre-order", "preorder"),
-            ("preorder", "preorder"),
-            ("coming soon", "coming_soon"),
-            ("unavailable", "unavailable"),
-        ):
-            if needle in lower:
-                return label
-        stock_el = soup.select_one(
-            ".stock, .availability, .product-stock, .inventory_status"
+    def _keep_previous(self, log_message: str, *, http_status: int | None) -> WatcherResult:
+        """Echo stored state so apply_result is a no-op (no alert / no log spam)."""
+        st = self.state()
+        if st.baseline_set and st.fingerprint:
+            return WatcherResult(
+                watcher_id=self.id,
+                success=True,
+                fingerprint=st.fingerprint,
+                parsed=dict(st.parsed),
+                alerts=[],
+                log_message=log_message,
+                http_status=http_status,
+            )
+        # No baseline yet — store unknown so we can seed later without alerting.
+        return WatcherResult(
+            watcher_id=self.id,
+            success=True,
+            fingerprint=content_hash(UNKNOWN),
+            parsed={"stock": UNKNOWN, "price": None, "cart_enabled": False},
+            alerts=[],
+            log_message=log_message,
+            http_status=http_status,
         )
-        if stock_el:
-            return stock_el.get_text(" ", strip=True)[:80] or "unknown"
-        return "unknown"
+
+    def _stock_status(self, soup: BeautifulSoup, text: str) -> str:
+        # Prefer WooCommerce stock nodes when present.
+        for sel in (
+            "p.stock",
+            ".stock",
+            ".availability",
+            ".product-stock",
+            ".inventory_status",
+        ):
+            for el in soup.select(sel):
+                label = self._label_from_text(el.get_text(" ", strip=True))
+                if label != UNKNOWN:
+                    return label
+
+        label = self._label_from_text(text)
+        if label != UNKNOWN:
+            return label
+
+        # Title / meta sometimes carry the only reliable phrase.
+        if soup.title:
+            label = self._label_from_text(soup.title.get_text(" ", strip=True))
+            if label != UNKNOWN:
+                return label
+        for meta in soup.select('meta[name="description"], meta[property="og:description"]'):
+            content = meta.get("content") or ""
+            label = self._label_from_text(content)
+            if label != UNKNOWN:
+                return label
+
+        return UNKNOWN
+
+    def _label_from_text(self, text: str) -> str:
+        lower = text.lower()
+        for needle, label in STOCK_NEEDLES:
+            if needle.isascii():
+                if needle in lower:
+                    return label
+            elif needle in text:
+                return label
+        return UNKNOWN
 
     def _cart_enabled(self, soup: BeautifulSoup) -> bool:
         for sel in (
