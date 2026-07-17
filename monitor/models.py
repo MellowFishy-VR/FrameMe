@@ -88,6 +88,9 @@ class DiscordConfig:
     username: str = "FrameMe"  # webhook display name only
     # Post unified diffs when watchers detect substantive content changes
     send_changes: bool = True
+    # Keep bot Online via Gateway (REST-only bots otherwise show Offline)
+    presence: bool = True
+    presence_activity: str = "Steam Frame"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> DiscordConfig:
@@ -103,6 +106,10 @@ class DiscordConfig:
             tiers=tiers,
             username=str(data.get("username") or "FrameMe"),
             send_changes=bool(data.get("send_changes", True)),
+            presence=bool(data.get("presence", True)),
+            presence_activity=str(
+                data.get("presence_activity") or "Steam Frame"
+            ),
         )
 
 

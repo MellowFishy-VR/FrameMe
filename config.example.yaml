@@ -23,6 +23,8 @@ discord:
   webhook_url: ""
   tiers: [1, 2, 3]
   send_changes: true  # post unified diffs when pages/state change
+  presence: true      # keep bot Online while FrameMe is running (bot mode)
+  presence_activity: "Steam Frame"
   username: "FrameMe" # webhook display name only
 
 watchers:

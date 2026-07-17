@@ -4,3 +4,4 @@ PyYAML>=6.0
 beautifulsoup4>=4.12
 steam[client]>=1.4.4
 playwright>=1.40
+websocket-client>=1.6

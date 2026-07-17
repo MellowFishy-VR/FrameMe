@@ -12,6 +12,7 @@ from pathlib import Path
 
 from monitor.config import load_config
 from monitor.discord_notify import DiscordNotifier
+from monitor.discord_presence import DiscordPresence
 from monitor.http_client import HttpClient
 from monitor.models import AlertEvent, GlobalConfig, WatcherResult, utcnow
 from monitor.pics import PicsWatcherThread, pics_fallback_appdetails_poll
@@ -53,6 +54,18 @@ class MonitorEngine:
             username=dc.username,
             send_changes=dc.send_changes,
         )
+        self._discord_presence: DiscordPresence | None = None
+        if (
+            not self.dry_run
+            and self.discord.enabled
+            and self.discord.transport == "bot"
+            and dc.presence
+            and self.discord.bot_token
+        ):
+            self._discord_presence = DiscordPresence(
+                self.discord.bot_token,
+                activity_name=dc.presence_activity,
+            )
 
         self._watchers: list[BaseWatcher] = []
         self._scheduler: WatcherScheduler | None = None
@@ -73,6 +86,8 @@ class MonitorEngine:
             extra = ""
             if self.discord.send_changes:
                 extra = " + change diffs"
+            if self._discord_presence:
+                extra += " + presence"
             self.on_log(
                 f"Discord {self.discord.transport} enabled "
                 f"(tiers={sorted(self.discord.tiers)}{extra})."
@@ -221,11 +236,17 @@ class MonitorEngine:
             daemon=True,
         )
         self._thread.start()
+        if self._discord_presence:
+            self._discord_presence.start()
+            self.on_log("Discord bot presence starting (keeps bot Online).")
         self.on_log(f"Monitor engine started ({self.enabled_count} watchers).")
 
     def stop(self) -> None:
         self._stop.set()
         self._running = False
+        if self._discord_presence:
+            self._discord_presence.stop()
+            self._discord_presence = None
         if self._pics:
             self._pics.stop()
         if self._scheduler:

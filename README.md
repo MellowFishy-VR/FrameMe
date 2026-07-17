@@ -60,6 +60,8 @@ discord:
 
 When `send_changes` is true, substantive updates (e.g. Steam Frame sale page text) are posted as a `diff` embed — short diffs inline, longer ones as an attached `.diff` file. This is separate from alert embeds (you may get both if a change also triggers an alert).
 
+`presence: true` (default) opens a Discord Gateway session so the bot stays **Online** while FrameMe is running. Without that, REST-only bots always look Offline even though alerts still work.
+
 Prefer env vars so secrets stay out of `config.yaml`:
 
 ```bash
