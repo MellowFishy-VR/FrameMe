@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 from monitor.http_client import HttpClient, HttpError, backoff_until
@@ -23,6 +24,8 @@ class BaseWatcher(ABC):
         self.http = http
         self.store = store
         self.id = config.id
+        # Optional: engine sets this to forward substantive diffs (e.g. Discord)
+        self.on_change: Callable[..., None] | None = None
 
     @property
     def tier(self) -> int:
@@ -120,6 +123,18 @@ class BaseWatcher(ABC):
                 url=url,
                 alert=bool(result.alerts),
             )
+            if self.on_change:
+                try:
+                    self.on_change(
+                        self.id,
+                        summary,
+                        old_text=old_text or "",
+                        new_text=new_text or "",
+                        url=url,
+                        alert=bool(result.alerts),
+                    )
+                except Exception:
+                    pass
         except Exception:
             pass
 

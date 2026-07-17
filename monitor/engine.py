@@ -51,6 +51,7 @@ class MonitorEngine:
             channel_id=dc.channel_id,
             tiers=dc.tiers,
             username=dc.username,
+            send_changes=dc.send_changes,
         )
 
         self._watchers: list[BaseWatcher] = []
@@ -69,15 +70,45 @@ class MonitorEngine:
 
         self._build_watchers()
         if self.discord.enabled:
+            extra = ""
+            if self.discord.send_changes:
+                extra = " + change diffs"
             self.on_log(
                 f"Discord {self.discord.transport} enabled "
-                f"(tiers={sorted(self.discord.tiers)})."
+                f"(tiers={sorted(self.discord.tiers)}{extra})."
             )
         elif dc.enabled:
             self.on_log(
                 "Discord enabled in config but not configured "
                 "(need webhook_url, or bot_token + channel_id)."
             )
+
+    def _on_change(
+        self,
+        source: str,
+        summary: str,
+        *,
+        old_text: str = "",
+        new_text: str = "",
+        url: str = "",
+        alert: bool = False,
+    ) -> None:
+        if self.dry_run or not self.discord.enabled:
+            return
+        try:
+            if self.discord.send_change(
+                source,
+                summary,
+                old_text=old_text,
+                new_text=new_text,
+                url=url,
+                alert=alert,
+            ):
+                self.on_log(f"Discord change diff sent: {source}")
+            elif self.discord.send_changes:
+                self.on_log(f"Discord change diff failed: {source}")
+        except Exception as exc:
+            self.on_log(f"Discord change error: {exc}")
 
     def _build_watchers(self) -> None:
         self._watchers = []
@@ -90,6 +121,7 @@ class MonitorEngine:
             if watcher is None:
                 self.on_log(f"Unknown watcher id in config: {wc.id}")
                 continue
+            watcher.on_change = self._on_change
             self._watchers.append(watcher)
 
     @property
@@ -236,6 +268,7 @@ class MonitorEngine:
                 self.store,
                 on_alert=self._emit_alert,
                 on_log=self.on_log,
+                on_change=self._on_change,
             )
             self._pics.start()
 

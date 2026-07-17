@@ -39,11 +39,11 @@ Inspired by [SteamFrameTracker](https://github.com/tomgamer22/SteamFrameTracker)
 
 ### Discord (optional)
 
-Forward alerts to a Discord channel. Two transports:
+Forward **alerts** and **content-change diffs** to a Discord channel. Two transports:
 
 | Mode | Needs | Notes |
 |------|--------|--------|
-| **bot** (preferred) | bot token + channel ID | No guild ID. Invite bot with **Send Messages** + **Embed Links**. |
+| **bot** (preferred) | bot token + channel ID | No guild ID. Invite bot with **Send Messages**, **Embed Links**, and **Attach Files**. |
 | **webhook** | webhook URL | Simpler, but the URL is a secret anyone can post with. |
 
 ```yaml
@@ -53,9 +53,12 @@ discord:
   bot_token: ""
   channel_id: ""
   webhook_url: ""
-  tiers: [1, 2, 3]    # 3 = Tier 3 digests
+  tiers: [1, 2, 3]    # which alert tiers to forward (3 = digests)
+  send_changes: true  # also post unified diffs when watchers change
   username: "FrameMe" # webhook display name only
 ```
+
+When `send_changes` is true, substantive updates (e.g. Steam Frame sale page text) are posted as a `diff` embed — short diffs inline, longer ones as an attached `.diff` file. This is separate from alert embeds (you may get both if a change also triggers an alert).
 
 Prefer env vars so secrets stay out of `config.yaml`:
 

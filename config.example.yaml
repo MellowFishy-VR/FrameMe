@@ -22,6 +22,7 @@ discord:
   channel_id: ""      # right-click channel → Copy Channel ID (Developer Mode)
   webhook_url: ""
   tiers: [1, 2, 3]
+  send_changes: true  # post unified diffs when pages/state change
   username: "FrameMe" # webhook display name only
 
 watchers:

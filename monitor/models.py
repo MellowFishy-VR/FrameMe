@@ -86,6 +86,8 @@ class DiscordConfig:
     # Which alert tiers to forward (3 = Tier 3 digests)
     tiers: list[int] = field(default_factory=lambda: [1, 2, 3])
     username: str = "FrameMe"  # webhook display name only
+    # Post unified diffs when watchers detect substantive content changes
+    send_changes: bool = True
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> DiscordConfig:
@@ -100,6 +102,7 @@ class DiscordConfig:
             channel_id=str(data.get("channel_id") or ""),
             tiers=tiers,
             username=str(data.get("username") or "FrameMe"),
+            send_changes=bool(data.get("send_changes", True)),
         )
 
 

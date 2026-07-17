@@ -43,12 +43,14 @@ class PicsWatcherThread:
         on_alert: Callable[[AlertEvent], None],
         on_log: Callable[[str], None],
         on_success: Callable[[], None] | None = None,
+        on_change: Callable[..., None] | None = None,
     ) -> None:
         self.config = config
         self.store = store
         self.on_alert = on_alert
         self.on_log = on_log
         self.on_success = on_success
+        self.on_change = on_change
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._tracked_subs: set[int] = set()
@@ -238,24 +240,42 @@ class PicsWatcherThread:
 
                     from monitor.changelog import append_change
 
-                    append_change(
-                        self.id,
+                    old_text = json.dumps(
+                        prev_content, indent=2, sort_keys=True, default=str
+                    )
+                    new_text = json.dumps(
+                        new_content, indent=2, sort_keys=True, default=str
+                    )
+                    summary = (
                         f"PICS snapshot changed cn={prev.get('change_number')}->"
                         f"{snapshot.get('change_number')}"
                         + (
                             f" | alerts: {'; '.join(a.title for a in alerts)}"
                             if alerts
                             else ""
-                        ),
-                        old_text=json.dumps(
-                            prev_content, indent=2, sort_keys=True, default=str
-                        ),
-                        new_text=json.dumps(
-                            new_content, indent=2, sort_keys=True, default=str
-                        ),
-                        url=STEAMDB_LINKS[STEAM_FRAME_APP][1],
+                        )
+                    )
+                    url = STEAMDB_LINKS[STEAM_FRAME_APP][1]
+                    append_change(
+                        self.id,
+                        summary,
+                        old_text=old_text,
+                        new_text=new_text,
+                        url=url,
                         alert=bool(alerts),
                     )
+                    if self.on_change:
+                        try:
+                            self.on_change(
+                                self.id,
+                                summary,
+                                old_text=old_text,
+                                new_text=new_text,
+                                url=url,
+                                alert=bool(alerts),
+                            )
+                        except Exception:
+                            pass
                 except Exception:
                     pass
 
